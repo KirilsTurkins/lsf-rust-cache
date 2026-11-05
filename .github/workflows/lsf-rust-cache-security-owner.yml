@@ -1,0 +1,169 @@
+name: LSF Rust cache source and real cache owner
+on:
+  push:
+    branches:
+      - diag/20261105-rust-cache-security-owner
+permissions:
+  contents: read
+jobs:
+  source-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_COMMIT: 2a5441298775042332ac1da9e478ffcce3e075f2
+      SOURCE_TREE: 9f98acbfd89e15eac6e8614c2a7f394575d3590e
+      EVIDENCE: /tmp/lsf-rust-cache-source-evidence
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Authenticate candidate and diagnostic-only child
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --name-only "$SOURCE_COMMIT" HEAD)" = .github/workflows/lsf-rust-cache-security-owner.yml
+          git rev-parse HEAD "$SOURCE_COMMIT" "${SOURCE_COMMIT}^{tree}" | tee "$EVIDENCE/source-identities.txt"
+      - uses: KirilsTurkins/lsf-setup-node@34275fdec80b5be172c3327cadef76aa2f3b31c6
+        with:
+          node-version: 24.19.0
+      - name: Install locked graph and verify source controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.19.0
+          test "$(npm --version)" = 11.17.0
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm ls --all > "$EVIDENCE/npm-ls.txt"
+          node .lsf-source/verify-installed-deepmerge.mjs | tee "$EVIDENCE/installed-deepmerge.json"
+          node .lsf-source/verify-installed-minimatch.mjs | tee "$EVIDENCE/installed-minimatch.json"
+          node .lsf-source/verify-rust-cache-lock.mjs | tee "$EVIDENCE/verified-lock.json"
+          npm run test:security-source 2>&1 | tee "$EVIDENCE/source-tests.log"
+      - name: Rebuild and compare every runtime file
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run prepare 2>&1 | tee "$EVIDENCE/build.log"
+          git diff --exit-code "$SOURCE_COMMIT" -- dist
+          git ls-tree -r --name-only "$SOURCE_COMMIT" -- dist | LC_ALL=C sort > "$EVIDENCE/dist-expected.txt"
+          find dist -type f -print | LC_ALL=C sort > "$EVIDENCE/dist-actual.txt"
+          cmp "$EVIDENCE/dist-expected.txt" "$EVIDENCE/dist-actual.txt"
+          xargs -d '\n' sha256sum < "$EVIDENCE/dist-expected.txt" | tee "$EVIDENCE/runtime-sha256.txt"
+      - name: Retain exact source and runtime evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          for file in action.yml package.json package-lock.json .lsf-source/deepmerge-4.3.1-lsf-prototype-v1.repair.json .lsf-source/deepmerge-4.3.1-lsf-prototype-v1.source.json .lsf-source/deepmerge-4.3.1-lsf-prototype-v1.tar .lsf-source/verify-installed-deepmerge.mjs .lsf-source/minimatch-10.2.6.original.tgz .lsf-source/minimatch-10.2.6-lsf-bound-v1.tar .lsf-source/minimatch-10.2.6-lsf-bound-v1.repair.json .lsf-source/verify-installed-minimatch.mjs .lsf-source/minimatch-bounds.test.mjs .lsf-source/verify-rust-cache-lock.mjs .lsf-source/rust-cache-lock.test.mjs; do
+            if test -f "$file"; then mkdir -p "$EVIDENCE/$(dirname "$file")"; cp "$file" "$EVIDENCE/$file"; fi
+          done
+          if test -d dist; then cp -a dist "$EVIDENCE/dist"; fi
+          (cd "$EVIDENCE" && find . -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/lsf-rust-cache-source-sha256.txt)
+          cp /tmp/lsf-rust-cache-source-sha256.txt "$EVIDENCE/SHA256SUMS"
+      - uses: KirilsTurkins/lsf-upload-artifact@d74a697ce553b389f4219545e07c97fb8542c64f
+        if: always()
+        with:
+          name: lsf-rust-cache-source-evidence
+          path: /tmp/lsf-rust-cache-source-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+  save:
+    needs: source-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SOURCE_COMMIT: 2a5441298775042332ac1da9e478ffcce3e075f2
+      SOURCE_TREE: 9f98acbfd89e15eac6e8614c2a7f394575d3590e
+      CARGO_HOME: ${{ github.workspace }}/.lsf-owner-cargo
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Authenticate candidate and prepare isolated offline crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --name-only "$SOURCE_COMMIT" HEAD)" = .github/workflows/lsf-rust-cache-security-owner.yml
+          mkdir -p owner-workspace/src "$CARGO_HOME"
+          printf '[package]\nname = "lsf_cache_owner"\nversion = "0.0.0"\nedition = "2021"\n[lib]\npath = "src/lib.rs"\n' > owner-workspace/Cargo.toml
+          printf 'pub fn witness() -> u32 { 42 }\n' > owner-workspace/src/lib.rs
+          cargo generate-lockfile --offline --manifest-path owner-workspace/Cargo.toml
+          test ! -e owner-cache/marker.txt
+      - name: Restore unique initially empty key
+        id: cache
+        uses: ./
+        with:
+          workspaces: owner-workspace
+          shared-key: lsf-owner-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-directories: ${{ github.workspace }}/owner-cache
+          cache-provider: github
+          cache-bin: 'false'
+          cache-workspace-crates: 'true'
+      - name: Assert miss and create saved payload
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$CACHE_HIT" = false
+          cargo build --locked --offline --manifest-path owner-workspace/Cargo.toml
+          mkdir -p owner-cache
+          printf 'lsf-owner-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > owner-cache/marker.txt
+          test -s owner-cache/marker.txt
+          compgen -G 'owner-workspace/target/debug/deps/liblsf_cache_owner-*.rlib' >/dev/null
+  restore:
+    needs: save
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SOURCE_COMMIT: 2a5441298775042332ac1da9e478ffcce3e075f2
+      SOURCE_TREE: 9f98acbfd89e15eac6e8614c2a7f394575d3590e
+      CARGO_HOME: ${{ github.workspace }}/.lsf-owner-cargo
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Authenticate candidate and prepare identical offline crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "$SOURCE_TREE"
+          test "$(git diff --name-only "$SOURCE_COMMIT" HEAD)" = .github/workflows/lsf-rust-cache-security-owner.yml
+          mkdir -p owner-workspace/src "$CARGO_HOME"
+          printf '[package]\nname = "lsf_cache_owner"\nversion = "0.0.0"\nedition = "2021"\n[lib]\npath = "src/lib.rs"\n' > owner-workspace/Cargo.toml
+          printf 'pub fn witness() -> u32 { 42 }\n' > owner-workspace/src/lib.rs
+          cargo generate-lockfile --offline --manifest-path owner-workspace/Cargo.toml
+          test ! -e owner-cache/marker.txt
+          test ! -d owner-workspace/target
+      - name: Restore the saved key
+        id: cache
+        uses: ./
+        with:
+          workspaces: owner-workspace
+          shared-key: lsf-owner-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-directories: ${{ github.workspace }}/owner-cache
+          cache-provider: github
+          cache-bin: 'false'
+          cache-workspace-crates: 'true'
+          save-if: 'false'
+      - name: Assert exact hit, restored marker and Rust object
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$CACHE_HIT" = true
+          printf 'lsf-owner-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" | cmp - owner-cache/marker.txt
+          compgen -G 'owner-workspace/target/debug/deps/liblsf_cache_owner-*.rlib' >/dev/null
+          cargo check --locked --offline --manifest-path owner-workspace/Cargo.toml
