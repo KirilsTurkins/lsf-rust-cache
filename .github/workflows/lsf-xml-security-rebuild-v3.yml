@@ -1,0 +1,54 @@
+name: LSF XML parser security rebuild v3
+on:
+  push:
+    branches: [ci/fast-xml-5-12-20261113]
+    paths: [.github/workflows/lsf-xml-security-rebuild-v3.yml]
+permissions:
+  contents: write
+jobs:
+  rebuild:
+    if: github.repository == 'KirilsTurkins/lsf-rust-cache' && github.ref == 'refs/heads/ci/fast-xml-5-12-20261113'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REVIEWED_BASE: 38534d49940bc6c6aef1e8dfd45349a99d37f14e
+      CI: 'true'
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: KirilsTurkins/lsf-setup-node@34275fdec80b5be172c3327cadef76aa2f3b31c6
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - name: Authenticate exact driver and preserve rename deletions
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 --output "$RUNNER_TEMP/repair.py" https://raw.githubusercontent.com/KirilsTurkins/latent-service-fabric/591f697aa19cc14f3ef5842820761068ff695b04/.github/maintenance/action_xml_repair_v2.py
+          test "$(git hash-object "$RUNNER_TEMP/repair.py")" = d16d65b1a7c1a3fa3478505b7c9053170035963c
+          python3 - <<'PY'
+          import os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'repair.py';s=p.read_text()
+          before="exec(compile(source,'authenticated_action_xml_repair_v2.py','exec'))"
+          after="change(\"['git','diff','--name-only',BASE,'HEAD']\",\"['git','diff','--no-renames','--name-only',BASE,'HEAD']\")\n"+before
+          assert s.count(before)==1;p.write_text(s.replace(before,after))
+          PY
+      - name: Rebuild and execute original source and runtime controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xml-repair-evidence"
+          python3 "$RUNNER_TEMP/repair.py" build 2>&1 | tee "$RUNNER_TEMP/xml-repair-evidence/validation.log"
+      - name: Export exact tested tree with complete rename handling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/repair.py" upload
+      - uses: KirilsTurkins/lsf-upload-artifact@d74a697ce553b389f4219545e07c97fb8542c64f
+        if: always()
+        with:
+          name: xml-security-lsf-rust-cache
+          path: ${{ runner.temp }}/xml-repair-evidence/
+          retention-days: 7
+          if-no-files-found: error
