@@ -34975,10 +34975,10 @@ async function getCacheProvider() {
     let cache;
     switch (cacheProvider) {
         case "github":
-            cache = await import('./cache-DqPewXTO.js');
+            cache = await import('./cache-BpHML6ak.js');
             break;
         case "warpbuild":
-            cache = await import('./cache-Dt0HXnmv.js').then(function (n) { return n.c; });
+            cache = await import('./cache-Dst5U3RU.js').then(function (n) { return n.c; });
             break;
         default:
             throw new Error(`The \`cache-provider\` \`${cacheProvider}\` is not valid.`);
